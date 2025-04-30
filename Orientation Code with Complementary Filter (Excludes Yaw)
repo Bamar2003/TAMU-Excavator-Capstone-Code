@@ -1,0 +1,136 @@
+import time
+import math
+from smbus2 import SMBus
+from icm20948 import ICM20948
+
+class SimpleFusion:
+    def __init__(self):
+        self._pitch = 0
+        self._roll = 0
+        self._previous_time = time.time()
+
+    def init(self, filter_update_rate, pitch_gyro_favoring, roll_gyro_favoring):
+        self._filter_update_rate = filter_update_rate
+        self._pitch_gyro_favoring = pitch_gyro_favoring
+        self._roll_gyro_favoring = roll_gyro_favoring
+
+        if not (0 <= pitch_gyro_favoring <= 1) or not (0 <= roll_gyro_favoring <= 1):
+            return False
+
+        self._pitch = 0
+        self._roll = 0
+        self._previous_time = time.time()
+        return True
+
+    def should_update_data(self):
+        now = time.time()
+        dt = now - self._previous_time
+        interval = 1.0 / self._filter_update_rate
+
+        if dt >= interval:
+            self._previous_time = now
+            return True
+        return False
+
+    def get_filtered_angles(self, accelerometer, gyroscope, magnetometer, angle_unit='degrees'):
+        pitch_from_accel = math.atan2(
+            -accelerometer['x'],
+            math.sqrt(accelerometer['y'] ** 2 + accelerometer['z'] ** 2)
+        )
+        roll_from_accel = math.atan2(
+            accelerometer['y'],
+            math.sqrt(accelerometer['x'] ** 2 + accelerometer['z'] ** 2)
+        )
+
+        dt = 1.0 / self._filter_update_rate
+        self._pitch = (self._pitch_gyro_favoring * (self._pitch + gyroscope['y'] * dt) +
+                       (1 - self._pitch_gyro_favoring) * pitch_from_accel)
+        self._roll = (self._roll_gyro_favoring * (self._roll + gyroscope['x'] * dt) +
+                      (1 - self._roll_gyro_favoring) * roll_from_accel)
+
+        # Magnetometer-based yaw
+        yaw = None
+        if magnetometer:
+            mx, my, mz = magnetometer['x'], magnetometer['y'], magnetometer['z']
+            # Tilt compensation
+            mx2 = mx * math.cos(self._pitch) + mz * math.sin(self._pitch)
+            my2 = (mx * math.sin(self._roll) * math.sin(self._pitch)
+                   + my * math.cos(self._roll)
+                   - mz * math.sin(self._roll) * math.cos(self._pitch))
+            yaw = math.atan2(-my2, mx2)
+            if yaw < 0:
+                yaw += 2 * math.pi
+
+        if angle_unit == 'degrees':
+            return {
+                'pitch': round(math.degrees(self._pitch), 1),
+                'roll': round(math.degrees(self._roll), 1),
+                'yaw': round(math.degrees(yaw), 1) if yaw is not None else None
+            }
+        else:
+            return {'pitch': self._pitch, 'roll': self._roll, 'yaw': yaw}
+
+
+def calibrate_gyro(imu, samples=200):
+    bias = {'x': 0, 'y': 0, 'z': 0}
+    for _ in range(samples):
+        _, _, _, gx, gy, gz = imu.read_accelerometer_gyro_data()
+        bias['x'] += gx
+        bias['y'] += gy
+        bias['z'] += gz
+        time.sleep(0.005)  # 200Hz
+
+    bias['x'] /= samples
+    bias['y'] /= samples
+    bias['z'] /= samples
+
+    return bias
+
+
+# --- Main ---
+I2C_ADDR = 0x69
+bus = SMBus(1)
+imu = ICM20948(i2c_addr=I2C_ADDR, i2c_bus=bus)
+
+print("Calibrating gyroscope... Keep sensor still.")
+gyro_bias = calibrate_gyro(imu)
+print(f"Gyro bias: {gyro_bias}")
+
+fusion = SimpleFusion()
+fusion.init(filter_update_rate=50, pitch_gyro_favoring=0.95, roll_gyro_favoring=0.95)
+
+print("Starting orientation tracking...")
+
+while True:
+    if fusion.should_update_data():
+        accelx_raw, accely_raw, accelz_raw, gyrox_raw, gyroy_raw, gyroz_raw = imu.read_accelerometer_gyro_data>        mx, my, mz = imu.read_magnetometer_data()
+
+        accel = {
+            'x': accelx_raw / 32768.0 * 2.0,
+            'y': accely_raw / 32768.0 * 2.0,
+            'z': accelz_raw / 32768.0 * 2.0
+        }
+
+        gyro_corrected = {
+            'x': gyrox_raw - gyro_bias['x'],
+            'y': gyroy_raw - gyro_bias['y'],
+            'z': gyroz_raw - gyro_bias['z']
+        }
+
+        gyro = {
+            'x': round(gyro_corrected['x'] / 32768.0 * 125.0 * (math.pi / 180.0), 1),
+            'y': round(gyro_corrected['y'] / 32768.0 * 125.0 * (math.pi / 180.0), 1),
+            'z': round(gyro_corrected['z'] / 32768.0 * 125.0 * (math.pi / 180.0), 1)
+        }
+
+        mag = {
+            'x': mx,
+            'y': my,
+            'z': mz
+        }
+
+        angles = fusion.get_filtered_angles(accel, gyro, mag, angle_unit='degrees')
+
+        print(f"Pitch: {angles['pitch']}°, Roll: {angles['roll']}°, Yaw: {angles['yaw']}°")
+
+    time.sleep(0.005)  # ~200Hz loop, fast enough for 50Hz filter
