@@ -1,0 +1,72 @@
+import time
+import board
+import busio
+import adafruit_ads1x15.ads1115 as ADS
+from adafruit_ads1x15.analog_in import AnalogIn
+
+# ── Precomputed calibration constant ─────────────────────────────────────────
+COMMON_GAIN_LB_PER_V = 1.07224  # lb per volt (from your earlier calibration)
+
+# zero‑out parameters
+NUM_TARE_SAMPLES = 100      # how many readings to average for zero‑load baseline
+TARE_SAMPLE_DELAY = 0.01    # seconds between each sample
+
+def setup_adc(address=0x48, pga=1):
+    """Initialize and return an ADS1115 ADC on the I2C bus."""
+    i2c = busio.I2C(board.SCL, board.SDA)
+    ads = ADS.ADS1115(i2c, address=address)
+    ads.gain = pga  # e.g. ±4.096 V full‑scale
+    return ads
+
+def average_voltage(channel, samples, delay):
+    """
+    Take multiple readings from the given channel and return the average voltage.
+    """
+    total = 0.0
+    for _ in range(samples):
+        total += channel.voltage
+        time.sleep(delay)
+    return total / samples
+
+def voltage_to_force(voltage, baseline):
+    """
+    Subtract the zero‑load baseline, then apply the common gain to get force in lb.
+    """
+    return (voltage - baseline) * COMMON_GAIN_LB_PER_V
+
+def main(poll_interval=0.5):
+    # 1) Initialize ADC and channels
+    ads = setup_adc()
+    ch0 = AnalogIn(ads, ADS.P0)
+    ch1 = AnalogIn(ads, ADS.P1)
+
+    # 2) Tare (zero‑out) at startup
+    print("Zero‑load tare: please ensure no load on sensors…")
+    baseline0 = average_voltage(ch0, NUM_TARE_SAMPLES, TARE_SAMPLE_DELAY)
+    baseline1 = average_voltage(ch1, NUM_TARE_SAMPLES, TARE_SAMPLE_DELAY)
+    print(f"Tare complete → Baseline voltages: Ch0 = {baseline0:.4f} V, Ch1 = {baseline1:.4f} V")
+    print(f"Using fixed gain = {COMMON_GAIN_LB_PER_V:.5f} lb/V\n")
+
+    # 3) Continuous readout
+    print("Reading forces (lb). Press Ctrl‑C to stop.\n")
+    try:
+        while True:
+            v0 = ch0.voltage
+            v1 = ch1.voltage
+
+            f0 = voltage_to_force(v0, baseline0)
+            f1 = voltage_to_force(v1, baseline1)
+            total = f0 + f1
+
+            print(f"Ch0: {v0:6.3f} V → {f0:7.4f} lb")
+            print(f"Ch1: {v1:6.3f} V → {f1:7.4f} lb")
+            print(f"> Combined: {total:7.4f} lb")
+            print("-" * 40)
+
+            time.sleep(poll_interval)
+
+    except KeyboardInterrupt:
+        print("\nExiting.")
+
+if __name__ == "__main__":
+    main()
