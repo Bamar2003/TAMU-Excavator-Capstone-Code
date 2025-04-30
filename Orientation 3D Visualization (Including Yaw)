@@ -1,0 +1,212 @@
+import os
+import time
+import math
+import numpy as np
+import threading
+from vispy import app, gloo
+from vispy.gloo import Program
+from icm20948 import ICM20948
+from smbus2 import SMBus
+import sdl2
+import sdl2.ext
+
+os.environ["VISPY_APP_BACKEND"] = "sdl2"
+sdl2.ext.init()
+
+ICM20948_I2C_ADDR = 0x69
+bus = SMBus(1)
+
+try:
+    imu = ICM20948(i2c_addr=ICM20948_I2C_ADDR, i2c_bus=bus)
+    print("IMU Initialized Successfully!")
+except Exception as e:
+    print(f"IMU Initialization Error: {e}")
+    exit(1)
+
+# --- Replace these with actual calibration results ---
+gyro_bias = {'x': -2.7355, 'y': 1.21461, 'z': 0.445877}
+mag_offset = {'x': -41.4, 'y': 11.25, 'z': 18.9}
+
+roll, pitch, yaw = 0.0, 0.0, 0.0
+prev_time = time.time()
+
+def imu_thread():
+    global roll, pitch, yaw, prev_time
+    while True:
+        try:
+            ax, ay, az, gx, gy, gz = imu.read_accelerometer_gyro_data()
+            mx, my, mz = imu.read_magnetometer_data()
+
+            current_time = time.time()
+            dt = current_time - prev_time
+            prev_time = current_time
+            accel = {
+                'x': ax / 32768.0 * 2.0,
+                'y': ay / 32768.0 * 2.0,
+                'z': az / 32768.0 * 2.0
+            }
+
+            gyro = {
+                'x': (gx - gyro_bias['x']) / 32768.0 * 125.0 * math.pi / 180.0,
+                'y': (gy - gyro_bias['y']) / 32768.0 * 125.0 * math.pi / 180.0,
+                'z': (gz - gyro_bias['z']) / 32768.0 * 125.0 * math.pi / 180.0
+            }
+
+            mag = {
+                'x': mx - mag_offset['x'],
+                'y': my - mag_offset['y'],
+                'z': mz - mag_offset['z']
+            }
+
+            pitch = math.atan2(-accel['x'], math.sqrt(accel['y'] ** 2 + accel['z'] ** 2))
+            roll = math.atan2(accel['y'], math.sqrt(accel['x'] ** 2 + accel['z'] ** 2))
+
+            mx2 = mag['x'] * math.cos(pitch) + mag['z'] * math.sin(pitch)
+            my2 = (mag['x'] * math.sin(roll) * math.sin(pitch) +
+                   mag['y'] * math.cos(roll) -
+                   mag['z'] * math.sin(roll) * math.cos(pitch))
+            yaw_val = math.atan2(-my2, mx2)
+            if yaw_val > math.pi:
+                yaw_val -= 2 * math.pi
+
+            roll_deg = math.degrees(roll)
+            pitch_deg = math.degrees(pitch)
+            yaw_deg = math.degrees(yaw_val)
+
+            roll, pitch, yaw = roll_deg, pitch_deg, yaw_deg
+
+        except Exception as e:
+            print(f"IMU Read Error: {e}")
+
+imu_thread = threading.Thread(target=imu_thread, daemon=True)
+imu_thread.start()
+
+vertex_shader = """
+attribute vec3 a_position;
+uniform mat4 u_model;
+void main() {
+    gl_Position = u_model * vec4(a_position, 1.0);
+}
+"""
+
+fragment_shader = """
+void main() {
+    gl_FragColor = vec4(0.0, 0.5, 1.0, 0.4);
+}
+"""
+
+wireframe_shader = """
+void main() {
+    gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0);
+}
+"""
+
+axis_shader = """
+attribute vec3 a_position;
+attribute vec3 a_color;
+varying vec4 v_color;
+void main() {
+    gl_Position = vec4(a_position, 1.0);
+    v_color = vec4(a_color, 1.0);
+}
+"""
+
+axis_fragment_shader = """
+varying vec4 v_color;
+void main() {
+    gl_FragColor = v_color;
+}
+"""
+
+cube_vertices = np.array([
+    [-0.5, -0.5, -0.5], [0.5, -0.5, -0.5],
+    [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5],
+    [-0.5, -0.5, 0.5], [0.5, -0.5, 0.5],
+    [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5]
+], dtype=np.float32)
+
+cube_indices = np.array([
+    0, 1, 2, 2, 3, 0,
+    1, 5, 6, 6, 2, 1,
+    5, 4, 7, 7, 6, 5,
+    4, 0, 3, 3, 7, 4,
+    3, 2, 6, 6, 7, 3,
+    4, 5, 1, 1, 0, 4
+], dtype=np.uint32)
+
+axis_vertices = np.array([
+    [0, 0, 0], [1, 0, 0],
+    [0, 0, 0], [0, 1, 0],
+    [0, 0, 0], [0, 0, 1]
+], dtype=np.float32)
+
+axis_colors = np.array([
+    [1, 0, 0], [1, 0, 0],
+    [0, 1, 0], [0, 1, 0],
+    [0, 0, 1], [0, 0, 1]
+], dtype=np.float32)
+
+class IMUVisualizer(app.Canvas):
+    def __init__(self):
+        app.Canvas.__init__(self, title='IMU 3D Visualization (SDL2)', size=(600, 600))
+        self.program = Program(vertex_shader, fragment_shader)
+        self.vertex_buffer = gloo.VertexBuffer(cube_vertices)
+        self.index_buffer = gloo.IndexBuffer(cube_indices)
+        self.program['a_position'] = self.vertex_buffer
+
+        self.wire_program = Program(vertex_shader, wireframe_shader)
+        self.wire_program['a_position'] = self.vertex_buffer
+
+        self.axis_program = Program(axis_shader, axis_fragment_shader)
+        self.axis_vertex_buffer = gloo.VertexBuffer(axis_vertices)
+        self.axis_color_buffer = gloo.VertexBuffer(axis_colors)
+        self.axis_program['a_position'] = self.axis_vertex_buffer
+        self.axis_program['a_color'] = self.axis_color_buffer
+
+        self.timer = app.Timer(interval=0.05, connect=self.update_orientation, start=True)
+        gloo.set_viewport(0, 0, *self.physical_size)
+        self.show()
+
+    def update_orientation(self, event):
+        global roll, pitch, yaw
+        roll_rad = np.radians(roll)
+        pitch_rad = np.radians(pitch)
+        yaw_rad = np.radians(yaw)
+
+        Rx = np.array([
+            [1, 0, 0, 0],
+            [0, np.cos(roll_rad), -np.sin(roll_rad), 0],
+            [0, np.sin(roll_rad), np.cos(roll_rad), 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float32)
+
+        Ry = np.array([
+            [np.cos(pitch_rad), 0, np.sin(pitch_rad), 0],
+            [0, 1, 0, 0],
+            [-np.sin(pitch_rad), 0, np.cos(pitch_rad), 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float32)
+
+        Rz = np.array([
+            [np.cos(yaw_rad), -np.sin(yaw_rad), 0, 0],
+            [np.sin(yaw_rad), np.cos(yaw_rad), 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float32)
+
+        self.model_matrix = Rz @ Ry @ Rx
+        self.program['u_model'] = self.model_matrix
+        self.wire_program['u_model'] = self.model_matrix
+        self.update()
+
+    def on_draw(self, event):
+        gloo.clear()
+        self.program.draw('triangles', indices=self.index_buffer)
+        self.wire_program.draw('lines')
+        self.axis_program.draw('lines')
+
+if __name__ == '__main__':
+    canvas = IMUVisualizer()
+    app.run()
+    sdl2.ext.quit()
+
